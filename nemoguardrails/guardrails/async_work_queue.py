@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import contextvars
 import logging
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Generic, List, Tuple, TypeVar
@@ -32,6 +33,9 @@ class WorkItem(Generic[T]):
     args: Tuple[Any, ...]
     kwargs: Dict[str, Any]
     future: asyncio.Future[T]
+    # The submitter's context, so the work sees the caller's contextvars (OpenTelemetry's
+    # current span and baggage among them) rather than the ones the worker was started with.
+    context: contextvars.Context
 
 
 class AsyncWorkQueue(Generic[T]):
@@ -130,7 +134,7 @@ class AsyncWorkQueue(Generic[T]):
         loop = asyncio.get_running_loop()
         future = loop.create_future()
 
-        item = WorkItem(func, args, kwargs, future)
+        item = WorkItem(func, args, kwargs, future, contextvars.copy_context())
 
         # If the queue is full, this will raise an asyncio.QueueFull exception to be caught
         # at a higher-level object (e.g. FastAPI to return a 429 or 503 error)
@@ -152,7 +156,10 @@ class AsyncWorkQueue(Generic[T]):
 
                 try:
                     self._busy_count += 1  # No race condition since it's not await'ed
-                    result = await item.func(*item.args, **item.kwargs)
+                    # A worker is a long-lived task whose context was fixed when the pool started.
+                    # Running the work as a task in the submitter's context is what carries the
+                    # caller's contextvars across the queue.
+                    result = await asyncio.create_task(item.func(*item.args, **item.kwargs), context=item.context)
                     if not item.future.cancelled():
                         item.future.set_result(result)
                 except Exception as e:
