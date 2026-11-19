@@ -26,6 +26,7 @@ These tests verify the async work queue implementation including:
 """
 
 import asyncio
+import contextvars
 from typing import Any
 
 import pytest
@@ -889,3 +890,35 @@ class TestWorkerErrorHandling:
                 assert "RuntimeError" in call_args[0][0]
 
                 await queue.stop()
+
+
+_caller = contextvars.ContextVar("_caller", default=None)
+
+
+class TestContextPropagation:
+    """Submitted work runs in the submitter's context, not the one the workers started in."""
+
+    @staticmethod
+    async def _submit_as(queue: AsyncWorkQueue, caller: str) -> Any:
+        async def read_caller():
+            await asyncio.sleep(0)
+            return _caller.get()
+
+        _caller.set(caller)
+        return await queue.submit(read_caller)
+
+    @pytest.mark.asyncio
+    async def test_work_sees_the_submitters_context_when_started_before_any_submit(self):
+        async with AsyncWorkQueue[Any](name="test_queue", max_queue_size=10, max_concurrency=2) as queue:
+            seen = await asyncio.gather(*(asyncio.create_task(self._submit_as(queue, c)) for c in ("a", "b", "c")))
+        assert seen == ["a", "b", "c"]
+
+    @pytest.mark.asyncio
+    async def test_work_does_not_keep_the_context_of_the_submit_that_started_the_queue(self):
+        queue = AsyncWorkQueue[Any](name="test_queue", max_queue_size=10, max_concurrency=2)
+        try:
+            first = await asyncio.create_task(self._submit_as(queue, "first"))
+            later = await asyncio.gather(*(asyncio.create_task(self._submit_as(queue, c)) for c in ("a", "b")))
+        finally:
+            await queue.stop()
+        assert (first, later) == ("first", ["a", "b"])
